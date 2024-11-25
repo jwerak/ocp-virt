@@ -1,0 +1,1091 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: next-gen-virt
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  creationTimestamp: null
+  name: letsencrypt
+  namespace: next-gen-virt
+---
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: install-scripts
+  namespace: next-gen-virt
+data:
+  elasticsearch.sh: |-
+    subscription-manager register --activationkey  --org
+    subscription-manager attach --auto
+    cat << EOF > /etc/yum.repos.d/elastic.repo
+    [elasticsearch]
+    name=Elasticsearch repository for 8.x packages
+    baseurl=https://artifacts.elastic.co/packages/8.x/yum
+    gpgcheck=1
+    gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    enabled=0
+    autorefresh=1
+    type=rpm-md
+    EOF
+    update-crypto-policies --set DEFAULT:SHA1
+    rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dnf install -y --enablerepo=elasticsearch elasticsearch-8.7.0
+    update-crypto-policies --set DEFAULT
+    systemctl daemon-reload
+    mkdir -p /srv/elasticsearch/config
+    mkdir -p /srv/elasticsearch/data
+    chown elasticsearch:elasticsearch /srv/elasticsearch -R
+    mkfs.xfs /dev/disk/by-id/virtio-datadisk
+    config=$(ls -1 /dev/disk/by-id/virtio-00yaml)
+    mount $config /srv/elasticsearch/config
+    mount /dev/disk/by-id/virtio-datadisk /srv/elasticsearch/data
+    echo "$config /srv/elasticsearch/config iso9660 defaults 0 0" >> /etc/fstab
+    echo '/dev/disk/by-id/virtio-datadisk /srv/elasticsearch/data   xfs defaults 0 0' >> /etc/fstab
+    mv /etc/elasticsearch/elasticsearch.yml /etc/elasticsearch/elasticsearch.yml.org
+    mv /etc/elasticsearch/jvm.options       /etc/elasticsearch/jvm.options.org
+    ln -sf /srv/elasticsearch/config/elasticsearch.conf /etc/elasticsearch/elasticsearch.yml
+    ln -sf /srv/elasticsearch/config/jvm.options        /etc/elasticsearch/jvm.options
+    systemctl enable elasticsearch --now
+  system.sh: |-
+    cert=$(ls -1 /dev/disk/by-id/virtio-00cert)
+    mount $cert /etc/cockpit/ws-certs.d/
+    if [ -f "/etc/cockpit/ws-certs.d/tls.crt" ]; then echo "$cert /etc/cockpit/ws-certs.d/ xfs defaults 0 0" >> /etc/fstab;
+    else umount $cert; fi
+    systemctl enable cockpit.socket --now
+immutable: false
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: es-master-svc
+  namespace: next-gen-virt
+spec:
+  ports:
+    - name: elasticsearch
+      protocol: TCP
+      port: 9200
+      targetPort: 9200
+  selector:
+    app: elasticsearch
+    elasticsearch: master
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: elasticsearch
+  namespace: next-gen-virt
+  annotations:
+    cert-utils-operator.redhat-cop.io/certs-from-secret: letsencrypt
+  labels:
+    app: elasticsearch
+    role: api
+spec:
+  host: elasticsearch.
+  to:
+    kind: Service
+    name: es-master-svc
+  port:
+    targetPort: elasticsearch
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: next-gen-virt
+  annotations:
+    app.openshift.io/connects-to: '[{"apiVersion":"apps/v1","kind":"Deployment","name":"coordinate"}]'
+  labels:
+    app.kubernetes.io/part-of: kibana
+    app.openshift.io/runtime: elastic
+    app.openshift.io/name: kibana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      # securityContext:
+      #   seccompProfile:
+      #     type: RuntimeDefault
+      containers:
+        - name: kibana
+          image: docker.elastic.co/kibana/kibana:8.7.0
+          ports:
+            - containerPort: 5601
+          # securityContext:
+          #   allowPrivilegeEscalation: false
+          #   runAsNonRoot: true
+          #   capabilities:
+          #     drop:
+          #       - ALL
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: http://coordinate:9200
+            - name: SERVER_PUBLICBASEURL
+              value: https://kibana-demo.
+            - name: SERVER_NAME
+              value: kibana-demo.
+          resources: {}
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: next-gen-virt
+spec:
+  ports:
+    - name: ui
+      port: 5601
+      targetPort: 5601
+  selector:
+    app: kibana
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: kibana
+  namespace: next-gen-virt
+  labels:
+    app: kibana
+  annotations:
+    cert-utils-operator.redhat-cop.io/certs-from-secret: letsencrypt
+spec:
+  host: kibana.
+  to:
+    kind: Service
+    name: kibana
+  port:
+    targetPort: ui
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinate
+  namespace: next-gen-virt
+spec:
+  ports:
+    - name: elasticsearch
+      port: 9200
+      targetPort: 9200
+    - name: elasticsearch-discovery
+      port: 9300
+      targetPort: 9300
+  selector:
+    app: elasticsearch
+    elasticsearch: coordinate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinate
+  namespace: next-gen-virt
+  annotations:
+    app.openshift.io/connects-to: '[{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","name":"es-master00"},{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","name":"es-master01"},{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","name":"es-master02"}]'
+  labels:
+    app.kubernetes.io/part-of: elasticsearch
+    app.openshift.io/runtime: elastic
+    app.openshift.io/name: coordinate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+      elasticsearch: coordinate
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        elasticsearch: coordinate
+    spec:
+      # securityContext:
+      #   seccompProfile:
+      #     type: RuntimeDefault
+      containers:
+        - name: coordinate
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.7.0-amd64
+          ports:
+            - containerPort: 9200
+            - containerPort: 9300
+          # securityContext:
+          #   allowPrivilegeEscalation: false
+          #   runAsNonRoot: true
+          #   capabilities:
+          #     drop:
+          #       - ALL
+          env:
+          - name: ES_JAVA_OPTS
+            value: -Xms4g -Xmx4g
+          - name: node.name
+            value: coordinate
+          - name: cluster.name
+            value: demo
+          - name: xpack.security.enabled
+            value: "false"
+          - name: xpack.security.transport.ssl.enabled
+            value: "false"
+          - name: xpack.security.http.ssl.enabled
+            value: "false"
+          - name: discovery.seed_hosts
+            value: es-master00,es-master01,es-master02
+          - name: node.roles
+            value: "[]"
+          - name: network.publish_host
+            value: coordinate.next-gen-virt.svc.cluster.local
+          - name: network.host
+            value: _site_
+          resources: {}
+      restartPolicy: Always
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: coordinate
+  namespace: next-gen-virt
+  annotations:
+    cert-utils-operator.redhat-cop.io/certs-from-secret: letsencrypt
+  labels:
+    app: elasticsearch
+    role: coordinate
+spec:
+  host: coordinate.
+  to:
+    kind: Service
+    name: coordinate
+  port:
+    targetPort: elasticsearch
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ubi9-install
+  namespace: next-gen-virt
+data:
+  install.sh: |-
+    mkdir /root/.ssh/
+    cp /mnt/demo.id_rsa /root/.ssh/id_rsa
+    chmod 700 /root/.ssh/
+    chmod 0400 /root/.ssh/id_rsa
+    yum install -y openssh-clients rsync
+    /bin/sh
+immutable: false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ubi9
+  annotations:
+    app.openshift.io/connects-to: '[{"apiVersion":"apps/v1","kind":"Deployment","name":"kibana"}]'
+  labels:
+    app: ubi9
+    app.kubernetes.io/part-of: utility
+    app.openshift.io/runtime: redhat
+    app.openshift.io/name: utility
+  namespace: next-gen-virt
+spec:
+  volumes:
+    - configMap:
+        name: ubi9-install
+      name: ubi9-install
+    - secret:
+        secretName: id-rsa
+      name: id-rsa
+  securityContext:
+    seLinuxOptions:
+      level: 's0:c31,c10'
+    seccompProfile:
+      type: "RuntimeDefault"
+  containers:
+    - name: ubi9
+      image: 'registry.access.redhat.com/ubi9/ubi'
+      command: ["/bin/sh"]
+      args: ["/usr/local/bin/install.sh"]
+      stdin: true
+      tty: true
+      volumeMounts:
+        - name: ubi9-install
+          readOnly: true
+          mountPath: /usr/local/bin/install.sh
+          subPath: install.sh
+        - name: id-rsa
+          readOnly: true
+          mountPath: /mnt/
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: data-generator-imagestream
+  namespace: next-gen-virt
+---
+kind: BuildConfig
+apiVersion: build.openshift.io/v1
+metadata:
+  annotations:
+    app.openshift.io/vcs-ref: ''
+    app.openshift.io/vcs-uri: 'https://github.com/purefield/ocp-virt'
+    openshift.io/generated-by: OpenShiftWebConsole
+  name: data-generator-buildconfig
+  namespace: next-gen-virt
+  labels:
+    app: data-generator
+    app.kubernetes.io/component: data-generator
+    app.kubernetes.io/instance: data-generator
+    app.kubernetes.io/name: data-generator
+    app.kubernetes.io/part-of: application
+    app.openshift.io/runtime: nodejs
+    app.openshift.io/runtime-version: 18-ubi9-minimal
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: 'data-generator-imagestream:latest'
+  resources: {}
+  successfulBuildsHistoryLimit: 2
+  failedBuildsHistoryLimit: 2
+  strategy:
+    type: Source
+    sourceStrategy:
+      from:
+        kind: ImageStreamTag
+        namespace: openshift
+        name: 'nodejs:18-ubi9-minimal'
+  postCommit: {}
+  source:
+    type: Git
+    git:
+      uri: 'https://github.com/purefield/ocp-virt'
+    contextDir: /generate-data
+  triggers:
+    - type: Generic
+      generic:
+        secretReference:
+          name: data-generator-generic-webhook-secret
+    - type: ConfigChange
+  runPolicy: Serial
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: data-generator
+  namespace: next-gen-virt
+  labels:
+    app: data-generator
+    app.kubernetes.io/component: data-generator
+    app.kubernetes.io/instance: data-generator
+    app.kubernetes.io/name: data-generator
+    app.kubernetes.io/part-of: application
+    app.openshift.io/runtime: nodejs
+    app.openshift.io/runtime-version: 18-ubi9-minimal
+  annotations:
+    app.openshift.io/connects-to: '[{"apiVersion":"apps/v1","kind":"Deployment","name":"coordinate"}]'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-generator
+  template:
+    metadata:
+      labels:
+        app: data-generator
+        deployment: data-generator
+    spec:
+      containers:
+        - name: data-generator
+          stdin: true
+          tty: true
+          image: >-
+            image-registry.openshift-image-registry.svc:5000/next-gen-virt/data-generator-imagestream
+          ports:
+            - containerPort: 3000
+              protocol: TCP
+          env:
+            - name: ES_NODE
+              value: coordinate
+            - name: ES_PORT
+              value: '9200'
+            - name: ES_INDEX
+              value: generated
+            - name: DATA_SIZE
+              value: '5'
+            - name: DATE_RATE
+              value: '10'
+            - name: DATA_BATCH
+              value: '100'
+          resources: {}
+          imagePullPolicy: Always
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+      maxSurge: 25%
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-generator
+  namespace: next-gen-virt
+spec:
+  selector:
+    app: data-generator
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: data-generator
+  namespace: next-gen-virt
+  labels: {}
+spec:
+  host: data-generator.
+  to:
+    kind: Service
+    name: data-generator
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+    destinationCACertificate: ''
+  port:
+    targetPort: 3000
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: es-master00-conf
+  namespace: next-gen-virt
+data:
+  elasticsearch.conf: |-
+    cluster.name: demo
+    node.name: es-master00
+    node.roles: [ master, data ]
+    network.host: _site_
+    network.publish_host: es-master00.next-gen-virt.svc.cluster.local
+    discovery.seed_hosts: ["es-master00","es-master01","es-master02"]
+    cluster.initial_master_nodes: ["es-master00","es-master01","es-master02"]
+    path.data: /srv/elasticsearch
+    path.logs: /var/log/elasticsearch
+    xpack.security.enabled: false
+    xpack.security.transport.ssl.enabled: false
+    xpack.security.http.ssl.enabled: false
+  jvm.options: |-
+    -Xms4096m
+    -Xmx4096m
+    -XX:+DisableExplicitGC
+    -XX:+AlwaysPreTouch
+    -server
+    -Djava.awt.headless=true
+    -Dfile.encoding=UTF-8
+    -Djna.nosys=true
+    -Djdk.io.permissionsUseCanonicalPath=true
+    -Dio.netty.noUnsafe=true
+    -Dio.netty.noKeySetOptimization=true
+    -Dlog4j.shutdownHookEnabled=false
+    -Dlog4j2.disable.jmx=true
+    -Dlog4j.skipJansi=true
+    -XX:+HeapDumpOnOutOfMemoryError
+immutable: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-master00
+  namespace: next-gen-virt
+spec:
+  selector:
+    node: es-master00
+  ports:
+    - name: elasticsearch
+      protocol: TCP
+      port: 9200
+      targetPort: 9200
+    - name: elasticsearch-discovery
+      protocol: TCP
+      port: 9300
+      targetPort: 9300
+    - name: ssh
+      protocol: TCP
+      port: 22
+      targetPort: 22
+    - name: cockpit
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: es-master00
+  namespace: next-gen-virt
+  labels:
+    app.kubernetes.io/part-of: elasticsearch
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        creationTimestamp: null
+        name: es-master00-data
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        source:
+          blank: {}
+        storage:
+          resources:
+            requests:
+              storage: 80Gi
+    - metadata:
+        creationTimestamp: null
+        name: es-master00
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        sourceRef:
+          kind: DataSource
+          name: rhel9
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
+          volumeMode: Block
+  running: true
+  template:
+    metadata:
+      annotations:
+        vm.kubevirt.io/os: rhel9
+        vm.kubevirt.io/workload: server
+      labels:
+        app: elasticsearch
+        node: es-master00
+        elasticsearch: master
+    spec:
+      domain:
+        cpu:
+          cores: 2
+          sockets: 1
+          threads: 2
+        devices:
+          disks:
+            - bootOrder: 1
+              disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+            - disk:
+                bus: virtio
+              name: elasticsearch-yaml
+              serial: 00yaml
+            - disk:
+                bus: virtio
+              name: install-scripts
+              serial: 0000sh
+            - disk:
+                bus: virtio
+              name: letsencrypt
+              serial: 00cert
+            - disk:
+                bus: virtio
+              name: data
+              serial: datadisk
+          interfaces:
+            - masquerade: {}
+              model: virtio
+              name: default
+        resources:
+          overcommitGuestOverhead: true
+          requests:
+            memory: 8Gi
+        memory:
+          guest: 16Gi
+      evictionStrategy: LiveMigrate
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 180
+      volumes:
+        - dataVolume:
+            name: es-master00
+          name: rootdisk
+        - dataVolume:
+            name: es-master00-data
+          name: data
+        - cloudInitNoCloud:
+            userData: |-
+              #cloud-config
+              hostname: es-master00
+              runcmd:
+                - mount /dev/disk/by-id/virtio-0000sh /mnt/
+                - bash /mnt/system.sh
+                - bash /mnt/elasticsearch.sh
+                - umount /mnt
+              user: elasticsearch
+              password: redhat
+              chpasswd: { expire: False }
+              ssh_authorized_keys:
+               - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwsZxASir/qUm4FCX+YY152oUGD9noMd42F21TNQk51 jwerak@X1
+          name: cloudinitdisk
+        - configMap:
+            name: es-master00-conf
+          name: elasticsearch-yaml
+        - configMap:
+            name: install-scripts
+          name: install-scripts
+        - secret:
+            secretName: letsencrypt
+          name: letsencrypt
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: es-master00
+  namespace: next-gen-virt
+spec:
+  host: es-master00.
+  to:
+    kind: Service
+    name: es-master00
+  port:
+    targetPort: cockpit
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: es-master01-conf
+  namespace: next-gen-virt
+data:
+  elasticsearch.conf: |-
+    cluster.name: demo
+    node.name: es-master01
+    node.roles: [ master, data ]
+    network.host: _site_
+    network.publish_host: es-master01.next-gen-virt.svc.cluster.local
+    discovery.seed_hosts: ["es-master00","es-master01","es-master02"]
+    cluster.initial_master_nodes: ["es-master00","es-master01","es-master02"]
+    path.data: /srv/elasticsearch
+    path.logs: /var/log/elasticsearch
+    xpack.security.enabled: false
+    xpack.security.transport.ssl.enabled: false
+    xpack.security.http.ssl.enabled: false
+  jvm.options: |-
+    -Xms4096m
+    -Xmx4096m
+    -XX:+DisableExplicitGC
+    -XX:+AlwaysPreTouch
+    -server
+    -Djava.awt.headless=true
+    -Dfile.encoding=UTF-8
+    -Djna.nosys=true
+    -Djdk.io.permissionsUseCanonicalPath=true
+    -Dio.netty.noUnsafe=true
+    -Dio.netty.noKeySetOptimization=true
+    -Dlog4j.shutdownHookEnabled=false
+    -Dlog4j2.disable.jmx=true
+    -Dlog4j.skipJansi=true
+    -XX:+HeapDumpOnOutOfMemoryError
+immutable: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-master01
+  namespace: next-gen-virt
+spec:
+  selector:
+    node: es-master01
+  ports:
+    - name: elasticsearch
+      protocol: TCP
+      port: 9200
+      targetPort: 9200
+    - name: elasticsearch-discovery
+      protocol: TCP
+      port: 9300
+      targetPort: 9300
+    - name: ssh
+      protocol: TCP
+      port: 22
+      targetPort: 22
+    - name: cockpit
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: es-master01
+  namespace: next-gen-virt
+  labels:
+    app.kubernetes.io/part-of: elasticsearch
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        creationTimestamp: null
+        name: es-master01-data
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        source:
+          blank: {}
+        storage:
+          resources:
+            requests:
+              storage: 80Gi
+    - metadata:
+        creationTimestamp: null
+        name: es-master01
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        sourceRef:
+          kind: DataSource
+          name: rhel9
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
+          volumeMode: Block
+  running: true
+  template:
+    metadata:
+      annotations:
+        vm.kubevirt.io/os: rhel9
+        vm.kubevirt.io/workload: server
+      labels:
+        app: elasticsearch
+        node: es-master01
+        elasticsearch: master
+    spec:
+      domain:
+        cpu:
+          cores: 2
+          sockets: 1
+          threads: 2
+        devices:
+          disks:
+            - bootOrder: 1
+              disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+            - disk:
+                bus: virtio
+              name: elasticsearch-yaml
+              serial: 00yaml
+            - disk:
+                bus: virtio
+              name: install-scripts
+              serial: 0000sh
+            - disk:
+                bus: virtio
+              name: letsencrypt
+              serial: 00cert
+            - disk:
+                bus: virtio
+              name: data
+              serial: datadisk
+          interfaces:
+            - masquerade: {}
+              model: virtio
+              name: default
+        resources:
+          overcommitGuestOverhead: true
+          requests:
+            memory: 8Gi
+        memory:
+          guest: 16Gi
+      evictionStrategy: LiveMigrate
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 180
+      volumes:
+        - dataVolume:
+            name: es-master01
+          name: rootdisk
+        - dataVolume:
+            name: es-master01-data
+          name: data
+        - cloudInitNoCloud:
+            userData: |-
+              #cloud-config
+              hostname: es-master01
+              runcmd:
+                - mount /dev/disk/by-id/virtio-0000sh /mnt/
+                - bash /mnt/system.sh
+                - bash /mnt/elasticsearch.sh
+                - umount /mnt
+              user: elasticsearch
+              password: redhat
+              chpasswd: { expire: False }
+              ssh_authorized_keys:
+               - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwsZxASir/qUm4FCX+YY152oUGD9noMd42F21TNQk51 jwerak@X1
+          name: cloudinitdisk
+        - configMap:
+            name: es-master01-conf
+          name: elasticsearch-yaml
+        - configMap:
+            name: install-scripts
+          name: install-scripts
+        - secret:
+            secretName: letsencrypt
+          name: letsencrypt
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: es-master01
+  namespace: next-gen-virt
+spec:
+  host: es-master01.
+  to:
+    kind: Service
+    name: es-master01
+  port:
+    targetPort: cockpit
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: es-master02-conf
+  namespace: next-gen-virt
+data:
+  elasticsearch.conf: |-
+    cluster.name: demo
+    node.name: es-master02
+    node.roles: [ master, data ]
+    network.host: _site_
+    network.publish_host: es-master02.next-gen-virt.svc.cluster.local
+    discovery.seed_hosts: ["es-master00","es-master01","es-master02"]
+    cluster.initial_master_nodes: ["es-master00","es-master01","es-master02"]
+    path.data: /srv/elasticsearch
+    path.logs: /var/log/elasticsearch
+    xpack.security.enabled: false
+    xpack.security.transport.ssl.enabled: false
+    xpack.security.http.ssl.enabled: false
+  jvm.options: |-
+    -Xms4096m
+    -Xmx4096m
+    -XX:+DisableExplicitGC
+    -XX:+AlwaysPreTouch
+    -server
+    -Djava.awt.headless=true
+    -Dfile.encoding=UTF-8
+    -Djna.nosys=true
+    -Djdk.io.permissionsUseCanonicalPath=true
+    -Dio.netty.noUnsafe=true
+    -Dio.netty.noKeySetOptimization=true
+    -Dlog4j.shutdownHookEnabled=false
+    -Dlog4j2.disable.jmx=true
+    -Dlog4j.skipJansi=true
+    -XX:+HeapDumpOnOutOfMemoryError
+immutable: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-master02
+  namespace: next-gen-virt
+spec:
+  selector:
+    node: es-master02
+  ports:
+    - name: elasticsearch
+      protocol: TCP
+      port: 9200
+      targetPort: 9200
+    - name: elasticsearch-discovery
+      protocol: TCP
+      port: 9300
+      targetPort: 9300
+    - name: ssh
+      protocol: TCP
+      port: 22
+      targetPort: 22
+    - name: cockpit
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: es-master02
+  namespace: next-gen-virt
+  labels:
+    app.kubernetes.io/part-of: elasticsearch
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        creationTimestamp: null
+        name: es-master02-data
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        source:
+          blank: {}
+        storage:
+          resources:
+            requests:
+              storage: 80Gi
+    - metadata:
+        creationTimestamp: null
+        name: es-master02
+        namespace: next-gen-virt
+      spec:
+        preallocation: false
+        sourceRef:
+          kind: DataSource
+          name: rhel9
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
+          volumeMode: Block
+  running: true
+  template:
+    metadata:
+      annotations:
+        vm.kubevirt.io/os: rhel9
+        vm.kubevirt.io/workload: server
+      labels:
+        app: elasticsearch
+        node: es-master02
+        elasticsearch: master
+    spec:
+      domain:
+        cpu:
+          cores: 2
+          sockets: 1
+          threads: 2
+        devices:
+          disks:
+            - bootOrder: 1
+              disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+            - disk:
+                bus: virtio
+              name: elasticsearch-yaml
+              serial: 00yaml
+            - disk:
+                bus: virtio
+              name: install-scripts
+              serial: 0000sh
+            - disk:
+                bus: virtio
+              name: letsencrypt
+              serial: 00cert
+            - disk:
+                bus: virtio
+              name: data
+              serial: datadisk
+          interfaces:
+            - masquerade: {}
+              model: virtio
+              name: default
+        resources:
+          overcommitGuestOverhead: true
+          requests:
+            memory: 8Gi
+        memory:
+          guest: 16Gi
+      evictionStrategy: LiveMigrate
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 180
+      volumes:
+        - dataVolume:
+            name: es-master02
+          name: rootdisk
+        - dataVolume:
+            name: es-master02-data
+          name: data
+        - cloudInitNoCloud:
+            userData: |-
+              #cloud-config
+              hostname: es-master02
+              runcmd:
+                - mount /dev/disk/by-id/virtio-0000sh /mnt/
+                - bash /mnt/system.sh
+                - bash /mnt/elasticsearch.sh
+                - umount /mnt
+              user: elasticsearch
+              password: redhat
+              chpasswd: { expire: False }
+              ssh_authorized_keys:
+               - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwsZxASir/qUm4FCX+YY152oUGD9noMd42F21TNQk51 jwerak@X1
+          name: cloudinitdisk
+        - configMap:
+            name: es-master02-conf
+          name: elasticsearch-yaml
+        - configMap:
+            name: install-scripts
+          name: install-scripts
+        - secret:
+            secretName: letsencrypt
+          name: letsencrypt
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: es-master02
+  namespace: next-gen-virt
+spec:
+  host: es-master02.
+  to:
+    kind: Service
+    name: es-master02
+  port:
+    targetPort: cockpit
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
